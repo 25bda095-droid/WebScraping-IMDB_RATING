@@ -4,6 +4,8 @@ A modern, full-stack web application that **live-scrapes IMDb reviews in real-ti
 
 CineScope goes beyond basic ratings—it reads the actual text of hundreds of user reviews, categorizes them using a deep learning model, and generates a beautiful analytics dashboard showcasing polarization, helpfulness metrics, spoiler ratios, and highlight reviews.
 
+Site_Link = https://webscraping-imdbrating.streamlit.app/
+
 ## 🌟 Features
 
 - **Real-Time Scraping:** Live connects to IMDb to pull the absolute newest reviews.
