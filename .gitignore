@@ -21,3 +21,4 @@ results/
 
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
+deployment_guide.md

@@ -228,7 +228,11 @@ def scrape_live_reviews(movie_id: str, status_container, max_reviews: int = 100)
 # 2. ML MODEL — Real DistilBERT Sentiment Classifier
 # ═══════════════════════════════════════════════════════════════════
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "movie_sentiment_model_v1_450movies")
+# ── STREAMLIT DEPLOYMENT SETTINGS ──
+# To deploy on Streamlit Cloud, you cannot upload the 250MB model to GitHub.
+# Instead, upload the contents of this folder to a Hugging Face repo (it's free)
+# and change MODEL_PATH to your repo ID, e.g., MODEL_PATH = "YourUsername/cinescope-sentiment"
+MODEL_PATH = "rish12112/cinescope-sentiment"
 LABEL_MAP = {0: "Negative", 1: "Mixed", 2: "Positive"}
 
 
@@ -813,7 +817,25 @@ def analyze_movie(movie_id: str):
     return results, "scraped"
 
 
+@st.cache_resource(show_spinner=False)
+def setup_deployment_environment():
+    """Run once on startup to prepare Streamlit Cloud environment."""
+    # 1. Write IMDb session secret to file if it exists
+    if "IMDB_SESSION" in st.secrets:
+        try:
+            with open(SESSION_FILE, "w", encoding="utf-8") as f:
+                f.write(st.secrets["IMDB_SESSION"])
+        except Exception:
+            pass
+
+    # 2. Ensure Playwright browsers are installed (for Streamlit Cloud)
+    os.system("playwright install chromium")
+    os.system("playwright install-deps chromium")
+
+
 def main():
+    setup_deployment_environment()
+
     st.set_page_config(
         page_title="CineScope — AI Movie Analyzer",
         page_icon="🎬",
