@@ -6,8 +6,11 @@ import html
 import re
 import os
 import urllib.parse
+import numpy as np
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+import torch
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
 
 # ═══════════════════════════════════════════════════════════════════
 # 1. SCRAPER LOGIC — Identical to IMDb_Review_Scraper.ipynb
@@ -111,10 +114,11 @@ def scrape_live_reviews(movie_id: str, status_container, max_reviews: int = 100)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
+        ua = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         if os.path.exists(SESSION_FILE):
-            context = browser.new_context(storage_state=SESSION_FILE)
+            context = browser.new_context(storage_state=SESSION_FILE, user_agent=ua)
         else:
-            context = browser.new_context()
+            context = browser.new_context(user_agent=ua)
 
         page = context.new_page()
         url = f"https://www.imdb.com/title/{movie_id}/reviews"
@@ -125,7 +129,7 @@ def scrape_live_reviews(movie_id: str, status_container, max_reviews: int = 100)
             # Robust retry for page navigation
             for attempt in range(5):
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    page.goto(url, wait_until="networkidle", timeout=60000)
                     try:
                         page.wait_for_selector("script#__NEXT_DATA__", state="attached", timeout=10000)
                     except Exception:
@@ -208,14 +212,49 @@ def scrape_live_reviews(movie_id: str, status_container, max_reviews: int = 100)
 
 
 # ═══════════════════════════════════════════════════════════════════
-# 2. ML MODEL PLACEHOLDER
-#    Replace the body of run_model() with your real trained model.
+# 2. ML MODEL — Real DistilBERT Sentiment Classifier
 # ═══════════════════════════════════════════════════════════════════
+
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "movie_sentiment_model_v1_450movies")
+LABEL_MAP = {0: "Negative", 1: "Mixed", 2: "Positive"}
+
+
+@st.cache_resource(show_spinner="Loading sentiment model...")
+def load_model():
+    """Load the fine-tuned DistilBERT model and tokenizer once, then cache."""
+    tokenizer = DistilBertTokenizerFast.from_pretrained(MODEL_PATH)
+    model = DistilBertForSequenceClassification.from_pretrained(MODEL_PATH)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    return tokenizer, model, device
+
+
+def predict_sentiments(reviews: list[str]) -> list[str]:
+    """Run batch inference on a list of review texts, return predicted labels."""
+    tokenizer, model, device = load_model()
+    predictions = []
+
+    # Process in batches of 16 to manage memory
+    batch_size = 16
+    for i in range(0, len(reviews), batch_size):
+        batch = reviews[i : i + batch_size]
+        inputs = tokenizer(batch, truncation=True, padding=True, max_length=512, return_tensors="pt")
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        preds = torch.argmax(outputs.logits, dim=-1).cpu().numpy()
+        predictions.extend([LABEL_MAP[p] for p in preds])
+
+    return predictions
+
 
 def run_model(reviews_df):
     """
-    Placeholder — returns mock stats so the UI has something to render.
-    Swap this out with your real model inference.
+    Run real DistilBERT inference on scraped reviews.
+    Returns a results dict consumed by the UI rendering functions.
     """
     if reviews_df is None or reviews_df.empty:
         return None
@@ -226,20 +265,62 @@ def run_model(reviews_df):
         else "Unknown Movie"
     )
 
-    # Truncate review text for display cards
-    pos_body = reviews_df.iloc[0]["review_body"] if "review_body" in reviews_df.columns else ""
-    neg_body = reviews_df.iloc[-1]["review_body"] if len(reviews_df) > 1 and "review_body" in reviews_df.columns else ""
-    pos_text = (pos_body[:300] + "…") if len(pos_body) > 300 else pos_body
-    neg_text = (neg_body[:300] + "…") if len(neg_body) > 300 else neg_body
+    # Get review texts and run model
+    review_texts = reviews_df["review_body"].fillna("").tolist()
+    sentiments = predict_sentiments(review_texts)
+    reviews_df = reviews_df.copy()
+    reviews_df["predicted_sentiment"] = sentiments
+
+    # Compute sentiment split percentages
+    total = len(sentiments)
+    pos_count = sentiments.count("Positive")
+    mix_count = sentiments.count("Mixed")
+    neg_count = sentiments.count("Negative")
+
+    pos_pct = round(pos_count / total * 100)
+    mix_pct = round(mix_count / total * 100)
+    neg_pct = 100 - pos_pct - mix_pct  # Ensure they sum to 100
+
+    # Compute a predicted score (weighted average: Positive=8.5, Mixed=5.5, Negative=3.0)
+    avg_score = round((pos_count * 8.5 + mix_count * 5.5 + neg_count * 3.0) / total, 1)
+
+    # Compute polarization (how spread apart the opinions are)
+    if pos_pct >= 70 or neg_pct >= 70:
+        polarization = "Low"
+    elif pos_pct >= 50 and neg_pct >= 20:
+        polarization = "High"
+    elif neg_pct >= 50 and pos_pct >= 20:
+        polarization = "High"
+    else:
+        polarization = "Medium"
+
+    # Find the best positive and negative review quotes
+    positive_reviews = reviews_df[reviews_df["predicted_sentiment"] == "Positive"]
+    negative_reviews = reviews_df[reviews_df["predicted_sentiment"] == "Negative"]
+
+    if not positive_reviews.empty:
+        # Pick the longest positive review as "most helpful" (more detail = more useful)
+        best_pos = positive_reviews.loc[positive_reviews["review_body"].str.len().idxmax(), "review_body"]
+    else:
+        best_pos = "No positive reviews found."
+
+    if not negative_reviews.empty:
+        best_neg = negative_reviews.loc[negative_reviews["review_body"].str.len().idxmax(), "review_body"]
+    else:
+        best_neg = "No negative reviews found."
+
+    # Truncate for display
+    pos_text = (best_pos[:300] + "…") if len(best_pos) > 300 else best_pos
+    neg_text = (best_neg[:300] + "…") if len(best_neg) > 300 else best_neg
 
     return {
         "movie_name": movie_name,
-        "total_reviews": len(reviews_df),
-        "sentiment_split": {"Positive": 65, "Mixed": 20, "Negative": 15},
-        "avg_predicted_score": 7.8,
-        "polarization_score": "Medium",
-        "top_positive": pos_text or "Great movie!",
-        "top_negative": neg_text or "Not my favorite.",
+        "total_reviews": total,
+        "sentiment_split": {"Positive": pos_pct, "Mixed": mix_pct, "Negative": neg_pct},
+        "avg_predicted_score": avg_score,
+        "polarization_score": polarization,
+        "top_positive": pos_text,
+        "top_negative": neg_text,
     }
 
 
@@ -453,8 +534,8 @@ html, body, [data-testid="stAppViewContainer"] {
     font-weight: 500 !important;
 }
 
-/* ── Hide default Streamlit chrome ────────────────────── */
-#MainMenu, footer, header { visibility: hidden; }
+/* ── Hide default Streamlit chrome (keep header for sidebar toggle) ── */
+#MainMenu, footer { visibility: hidden; }
 </style>
 """
 
@@ -534,21 +615,16 @@ def render_report(results, key_suffix=""):
 # ═══════════════════════════════════════════════════════════════════
 
 def analyze_movie(movie_id: str):
-    """Shared logic: check trained DB → fall back to live scrape → run model."""
-    trained_movie_ids = ["tt0371746", "tt0800080"]  # Placeholder — load your real list here
-
-    if movie_id in trained_movie_ids:
-        # Instant lookup from pre-computed data
-        df = pd.DataFrame([{"movie_name": "Trained Movie", "review_body": "Placeholder"}])
-        return run_model(df), "trained"
-    else:
-        with st.status("Live-analyzing from IMDb…", expanded=True) as status:
-            df = scrape_live_reviews(movie_id, status, max_reviews=100)
-            if df.empty:
-                status.update(label="Could not fetch reviews.", state="error")
-                return None, "error"
-            status.update(label=f"Done — {len(df)} reviews extracted!", state="complete")
-        return run_model(df), "scraped"
+    """Scrape reviews live from IMDb and run the sentiment model."""
+    with st.status("Live-analyzing from IMDb…", expanded=True) as status:
+        df = scrape_live_reviews(movie_id, status, max_reviews=100)
+        if df.empty:
+            status.update(label="Could not fetch reviews.", state="error")
+            return None, "error"
+        status.update(label=f"Running AI model on {len(df)} reviews...", state="running")
+        results = run_model(df)
+        status.update(label=f"Done — {len(df)} reviews analyzed!", state="complete")
+    return results, "scraped"
 
 
 def main():

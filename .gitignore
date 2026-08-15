@@ -15,6 +15,9 @@ env/
 .agents
 .claude
 
+# Ignore trained model artifacts (too large for GitHub — 256MB+)
+movie_sentiment_model_v1_450movies/
+results/
 
 # Ignore Jupyter notebook checkpoints
 .ipynb_checkpoints/
