@@ -1,0 +1,20 @@
+# Ignore environment variables and secrets
+.env
+.streamlit/secrets.toml
+
+# Ignore IMDb login session file to prevent credential leaks
+imdb_session.json
+*session*.json
+
+# Ignore Python cache and environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+.agents
+.claude
+
+
+# Ignore Jupyter notebook checkpoints
+.ipynb_checkpoints/
