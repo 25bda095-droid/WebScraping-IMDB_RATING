@@ -1,13 +1,14 @@
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import streamlit as st
 import pandas as pd
 import time
 import json
 import html
 import re
-import os
 import urllib.parse
 import numpy as np
-from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
 import torch
 from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification
@@ -126,31 +127,39 @@ def scrape_live_reviews(movie_id: str, status_container, max_reviews: int = 100)
         try:
             status_container.update(label="Connecting to IMDb...", state="running")
 
-            # Robust retry for page navigation
-            for attempt in range(5):
+            # Navigate with domcontentloaded (fast) + explicit wait for __NEXT_DATA__
+            loaded = False
+            for attempt in range(3):
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    # Wait for __NEXT_DATA__ to appear (critical for data extraction)
+                    page.wait_for_selector("script#__NEXT_DATA__", state="attached", timeout=10000)
+                    loaded = True
+                    break
+                except Exception:
+                    if attempt < 2:
+                        time.sleep(2)
+
+            if not loaded:
+                # Final attempt: try networkidle as fallback
                 try:
                     page.goto(url, wait_until="networkidle", timeout=60000)
-                    try:
-                        page.wait_for_selector("script#__NEXT_DATA__", state="attached", timeout=10000)
-                    except Exception:
-                        pass
-                    break
+                    loaded = True
                 except Exception as e:
-                    if attempt == 4:
-                        raise e
-                    time.sleep(3)
+                    status_container.update(label=f"Error loading page: {e}", state="error")
+                    return pd.DataFrame()
+
+            # Brief pause for redirects/hydration to settle (matches notebook behavior)
+            time.sleep(1.5)
 
             # Get movie name from page title
             movie_name = movie_id
-            for attempt in range(3):
-                try:
-                    title_str = page.title()
-                    movie_name = title_str.split(" - ")[0].strip() if title_str else movie_id
-                    break
-                except Exception:
-                    if attempt == 2:
-                        break
-                    time.sleep(3)
+            try:
+                title_str = page.title()
+                if title_str:
+                    movie_name = title_str.split(" - ")[0].strip()
+            except Exception:
+                pass
 
             status_container.update(label=f"Extracting reviews for {movie_name}...", state="running")
 
@@ -174,16 +183,20 @@ def scrape_live_reviews(movie_id: str, status_container, max_reviews: int = 100)
             for node in initial_data.get("edges", []):
                 reviews.append(parse_review_node(node, movie_id, movie_name))
 
+            # If initial extraction got nothing, start GraphQL from scratch
+            if not reviews and not cursor:
+                cursor = ""  # Empty string triggers first page in GraphQL
+
             seen_ids = {r["review_id"] for r in reviews}
 
-            # GraphQL pagination
+            # GraphQL pagination — fast loop with minimal delay
             empty_count = 0
-            while cursor and len(reviews) < max_reviews:
+            while cursor is not None and len(reviews) < max_reviews:
                 status_container.update(
                     label=f"Fetching reviews... {len(reviews)}/{max_reviews}",
                     state="running",
                 )
-                time.sleep(0.5)
+                time.sleep(0.15)  # Minimal delay to avoid rate-limiting
                 new_reviews, cursor = fetch_reviews_graphql_sync(page, movie_id, cursor, movie_name)
 
                 added = 0
@@ -254,7 +267,7 @@ def predict_sentiments(reviews: list[str]) -> list[str]:
 def run_model(reviews_df):
     """
     Run real DistilBERT inference on scraped reviews.
-    Returns a results dict consumed by the UI rendering functions.
+    Returns a rich results dict consumed by the UI rendering functions.
     """
     if reviews_df is None or reviews_df.empty:
         return None
@@ -271,7 +284,7 @@ def run_model(reviews_df):
     reviews_df = reviews_df.copy()
     reviews_df["predicted_sentiment"] = sentiments
 
-    # Compute sentiment split percentages
+    # ── Sentiment counts ──
     total = len(sentiments)
     pos_count = sentiments.count("Positive")
     mix_count = sentiments.count("Mixed")
@@ -279,12 +292,26 @@ def run_model(reviews_df):
 
     pos_pct = round(pos_count / total * 100)
     mix_pct = round(mix_count / total * 100)
-    neg_pct = 100 - pos_pct - mix_pct  # Ensure they sum to 100
+    neg_pct = 100 - pos_pct - mix_pct
 
-    # Compute a predicted score (weighted average: Positive=8.5, Mixed=5.5, Negative=3.0)
+    # ── AI predicted score ──
     avg_score = round((pos_count * 8.5 + mix_count * 5.5 + neg_count * 3.0) / total, 1)
 
-    # Compute polarization (how spread apart the opinions are)
+    # ── Avg user rating (from actual IMDb ratings) ──
+    rated_reviews = reviews_df[reviews_df["user_rating"].notna()]
+    avg_user_rating = round(rated_reviews["user_rating"].mean(), 1) if not rated_reviews.empty else None
+
+    # ── Rating distribution (1–10 histogram) ──
+    rating_dist = {}
+    if not rated_reviews.empty:
+        for r in range(1, 11):
+            rating_dist[r] = int((rated_reviews["user_rating"] == r).sum())
+
+    # ── Spoiler percentage ──
+    spoiler_count = int(reviews_df["spoiler"].sum()) if "spoiler" in reviews_df.columns else 0
+    spoiler_pct = round(spoiler_count / total * 100)
+
+    # ── Polarization ──
     if pos_pct >= 70 or neg_pct >= 70:
         polarization = "Low"
     elif pos_pct >= 50 and neg_pct >= 20:
@@ -294,33 +321,66 @@ def run_model(reviews_df):
     else:
         polarization = "Medium"
 
-    # Find the best positive and negative review quotes
+    # ── Community votes ──
+    total_upvotes = int(reviews_df["upvotes"].sum()) if "upvotes" in reviews_df.columns else 0
+    total_downvotes = int(reviews_df["downvotes"].sum()) if "downvotes" in reviews_df.columns else 0
+    community_votes = total_upvotes + total_downvotes
+    helpfulness_ratio = round(total_upvotes / community_votes * 100) if community_votes > 0 else 0
+
+    # ── Average review length ──
+    avg_review_len = int(reviews_df["review_body"].fillna("").str.split().str.len().mean())
+
+    # ── Audience verdict text ──
+    if pos_pct >= 75:
+        verdict = "🎯 Overwhelmingly Positive — Audiences love this film"
+    elif pos_pct >= 55:
+        verdict = "👍 Generally Positive — Most viewers enjoyed it"
+    elif neg_pct > pos_pct:
+        verdict = "👎 Divisive — More critics than fans"
+    else:
+        verdict = "🤔 Mixed Reception — Opinions are split"
+
+    # ── Best reviews by upvotes (full text, not truncated) ──
     positive_reviews = reviews_df[reviews_df["predicted_sentiment"] == "Positive"]
     negative_reviews = reviews_df[reviews_df["predicted_sentiment"] == "Negative"]
 
-    if not positive_reviews.empty:
-        # Pick the longest positive review as "most helpful" (more detail = more useful)
-        best_pos = positive_reviews.loc[positive_reviews["review_body"].str.len().idxmax(), "review_body"]
-    else:
-        best_pos = "No positive reviews found."
+    def pick_best_review(subset):
+        if subset.empty:
+            return None
+        # Pick by highest upvotes, break ties with longest review
+        if "upvotes" in subset.columns:
+            best_idx = subset["upvotes"].idxmax()
+        else:
+            best_idx = subset["review_body"].str.len().idxmax()
+        row = subset.loc[best_idx]
+        return {
+            "body": row.get("review_body", ""),
+            "title": row.get("review_title", ""),
+            "user_name": row.get("user_name", "Anonymous"),
+            "user_rating": row.get("user_rating"),
+            "upvotes": int(row.get("upvotes", 0)),
+            "downvotes": int(row.get("downvotes", 0)),
+        }
 
-    if not negative_reviews.empty:
-        best_neg = negative_reviews.loc[negative_reviews["review_body"].str.len().idxmax(), "review_body"]
-    else:
-        best_neg = "No negative reviews found."
-
-    # Truncate for display
-    pos_text = (best_pos[:300] + "…") if len(best_pos) > 300 else best_pos
-    neg_text = (best_neg[:300] + "…") if len(best_neg) > 300 else best_neg
+    best_positive = pick_best_review(positive_reviews)
+    best_negative = pick_best_review(negative_reviews)
 
     return {
         "movie_name": movie_name,
         "total_reviews": total,
         "sentiment_split": {"Positive": pos_pct, "Mixed": mix_pct, "Negative": neg_pct},
+        "sentiment_counts": {"Positive": pos_count, "Mixed": mix_count, "Negative": neg_count},
         "avg_predicted_score": avg_score,
+        "avg_user_rating": avg_user_rating,
+        "rating_distribution": rating_dist,
+        "spoiler_pct": spoiler_pct,
         "polarization_score": polarization,
-        "top_positive": pos_text,
-        "top_negative": neg_text,
+        "verdict": verdict,
+        "community_votes": community_votes,
+        "helpfulness_ratio": helpfulness_ratio,
+        "avg_review_length": avg_review_len,
+        "best_positive": best_positive,
+        "best_negative": best_negative,
     }
 
 
@@ -455,7 +515,7 @@ html, body, [data-testid="stAppViewContainer"] {
     vertical-align: middle;
 }
 
-/* ── Review quote card ───────────────────────────────── */
+/* ── Review quote card (scrollable, full-text) ───────── */
 .review-card {
     background: var(--bg-card);
     border: 1px solid var(--border-subtle);
@@ -475,12 +535,32 @@ html, body, [data-testid="stAppViewContainer"] {
 }
 .review-card .tag.positive { background: hsla(152,60%,52%,.15); color: var(--accent-green); }
 .review-card .tag.negative { background: hsla(0,72%,56%,.15); color: var(--accent-red); }
-.review-card .body {
-    font-size: .92rem;
-    line-height: 1.6;
+.review-card .review-title-text {
+    font-size: .95rem;
+    font-weight: 700;
     color: var(--text-primary);
-    font-style: italic;
+    margin-bottom: .45rem;
 }
+.review-card .body {
+    font-size: .88rem;
+    line-height: 1.65;
+    color: var(--text-primary);
+    max-height: 320px;
+    overflow-y: auto;
+    padding-right: 8px;
+}
+.review-card .body::-webkit-scrollbar { width: 4px; }
+.review-card .body::-webkit-scrollbar-thumb { background: var(--border-subtle); border-radius: 4px; }
+.review-card .review-meta {
+    display: flex;
+    gap: 1rem;
+    margin-top: .6rem;
+    padding-top: .6rem;
+    border-top: 1px solid var(--border-subtle);
+    font-size: .76rem;
+    color: var(--text-secondary);
+}
+.review-card .review-meta span { font-weight: 600; color: var(--text-primary); }
 
 /* ── Verdict banner ──────────────────────────────────── */
 .verdict-banner {
@@ -520,6 +600,48 @@ html, body, [data-testid="stAppViewContainer"] {
     opacity: .6;
 }
 
+/* ── Verdict description text ────────────────────────── */
+.verdict-desc {
+    font-size: .95rem;
+    color: var(--text-secondary);
+    text-align: center;
+    margin-top: .5rem;
+    line-height: 1.5;
+}
+
+/* ── Comparison table ────────────────────────────────── */
+.cmp-table {
+    width: 100%;
+    border-collapse: separate;
+    border-spacing: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin: 1rem 0;
+}
+.cmp-table th, .cmp-table td {
+    padding: .7rem 1rem;
+    text-align: center;
+    font-size: .88rem;
+    border-bottom: 1px solid var(--border-subtle);
+}
+.cmp-table th {
+    background: hsla(220, 14%, 18%, .5);
+    font-weight: 700;
+    color: var(--text-primary);
+    text-transform: uppercase;
+    font-size: .75rem;
+    letter-spacing: .06em;
+}
+.cmp-table td:first-child {
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+.cmp-table tr:last-child td { border-bottom: none; }
+.cmp-table .winner { color: var(--accent-green); font-weight: 700; }
+
 /* ── Section heading ─────────────────────────────────── */
 .section-heading {
     font-size: 1.05rem;
@@ -552,7 +674,7 @@ def stat_card(label: str, value: str, color: str = ""):
     </div>"""
 
 
-def sentiment_bar(pos: int, mix: int, neg: int):
+def sentiment_bar(pos: int, mix: int, neg: int, pos_n: int = 0, mix_n: int = 0, neg_n: int = 0):
     return f"""<div class="sentiment-bar-wrapper">
         <div class="bar-title">Sentiment Distribution</div>
         <div class="sentiment-bar">
@@ -561,53 +683,117 @@ def sentiment_bar(pos: int, mix: int, neg: int):
             <div class="seg-neg" style="width:{neg}%"></div>
         </div>
         <div class="sentiment-legend">
-            <div><span class="dot" style="background:var(--accent-green)"></span><span>{pos}%</span> Positive</div>
-            <div><span class="dot" style="background:var(--accent-amber)"></span><span>{mix}%</span> Mixed</div>
-            <div><span class="dot" style="background:var(--accent-red)"></span><span>{neg}%</span> Negative</div>
+            <div><span class="dot" style="background:var(--accent-green)"></span><span>{pos}%</span> Positive ({pos_n})</div>
+            <div><span class="dot" style="background:var(--accent-amber)"></span><span>{mix}%</span> Mixed ({mix_n})</div>
+            <div><span class="dot" style="background:var(--accent-red)"></span><span>{neg}%</span> Negative ({neg_n})</div>
         </div>
     </div>"""
 
 
-def review_card(text: str, sentiment: str):
+def review_card_html(review_data, sentiment: str):
+    """Render a full-text review card with metadata."""
+    if review_data is None:
+        label = "positive" if sentiment == "positive" else "negative"
+        return f"""<div class="review-card">
+    <div class="tag {label}">No {label} reviews</div>
+    <div class="body">No {label} reviews were found in the analyzed set.</div>
+</div>"""
+
     tag_cls = "positive" if sentiment == "positive" else "negative"
     tag_label = "Most Helpful Positive" if sentiment == "positive" else "Most Helpful Negative"
-    escaped = text.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+
+    body = review_data["body"].replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;').replace('\n', '<br>')
+    title = review_data.get("title", "").replace('<', '&lt;').replace('>', '&gt;')
+    user = review_data.get("user_name", "Anonymous") or "Anonymous"
+    rating = review_data.get("user_rating")
+    up = review_data.get("upvotes", 0)
+    down = review_data.get("downvotes", 0)
+
+    rating_str = f"★ {int(rating)}/10" if pd.notna(rating) else ""
+    title_html = f'<div class="review-title-text">{title}</div>' if title else ""
+    rating_html = f'<div>{rating_str}</div>' if rating_str else ""
+
     return f"""<div class="review-card">
-        <div class="tag {tag_cls}">{tag_label}</div>
-        <div class="body">"{escaped}"</div>
-    </div>"""
+    <div class="tag {tag_cls}">{tag_label}</div>
+    {title_html}
+    <div class="body">{body}</div>
+    <div class="review-meta">
+        <div>👤 <span>{user}</span></div>
+        {rating_html}
+        <div>👍 <span>{up}</span></div>
+        <div>👎 <span>{down}</span></div>
+    </div>
+</div>"""
 
 
 def render_report(results, key_suffix=""):
-    """Render a single movie report card with custom HTML components."""
+    """Render a single movie report card with all stats."""
     name = results["movie_name"]
     sent = results["sentiment_split"]
+    counts = results.get("sentiment_counts", {"Positive": 0, "Mixed": 0, "Negative": 0})
 
     st.markdown(f'<div class="section-heading">📊  {name}</div>', unsafe_allow_html=True)
 
-    # Top metrics row
+    # ── Row 1: Key Metrics ──
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown(stat_card("Predicted Rating", f"{results['avg_predicted_score']}/10", "gold"), unsafe_allow_html=True)
+        st.markdown(stat_card("AI Predicted Rating", f"{results['avg_predicted_score']}/10", "gold"), unsafe_allow_html=True)
     with c2:
-        st.markdown(stat_card("Polarization", results["polarization_score"], "amber"), unsafe_allow_html=True)
+        avg_ur = results.get("avg_user_rating")
+        ur_str = f"{avg_ur}/10" if avg_ur else "N/A"
+        st.markdown(stat_card("Avg User Rating", ur_str, "blue"), unsafe_allow_html=True)
     with c3:
         st.markdown(stat_card("Reviews Analyzed", str(results["total_reviews"]), "blue"), unsafe_allow_html=True)
     with c4:
-        st.markdown(stat_card("Positive Rate", f"{sent['Positive']}%", "green"), unsafe_allow_html=True)
+        st.markdown(stat_card("Spoiler Reviews", f"{results.get('spoiler_pct', 0)}%", "amber"), unsafe_allow_html=True)
 
-    # Sentiment bar
-    st.markdown(sentiment_bar(sent["Positive"], sent["Mixed"], sent["Negative"]), unsafe_allow_html=True)
+    # ── Row 2: Sentiment Bar ──
+    st.markdown(
+        sentiment_bar(sent["Positive"], sent["Mixed"], sent["Negative"],
+                      counts["Positive"], counts["Mixed"], counts["Negative"]),
+        unsafe_allow_html=True,
+    )
 
-    # Review highlights
+    # ── Row 3: Rating Distribution ──
+    rating_dist = results.get("rating_distribution", {})
+    if rating_dist:
+        st.markdown('<div class="section-heading">⭐ User Rating Distribution</div>', unsafe_allow_html=True)
+        chart_df = pd.DataFrame({
+            "Rating": [f"{r}★" for r in range(1, 11)],
+            "Count": [rating_dist.get(r, 0) for r in range(1, 11)],
+        }).set_index("Rating")
+        st.bar_chart(chart_df, color="#e6a817", height=220)
+
+    # ── Row 4: Verdict Banner ──
+    verdict = results.get("verdict", "")
+    st.markdown(
+        f"""<div class="verdict-banner">
+            <h3>{verdict}</h3>
+            <p>Polarization: <b>{results['polarization_score']}</b> · 
+            Community Engagement: <b>{results.get('community_votes', 0):,}</b> total votes</p>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    # ── Row 5: Full Review Highlights ──
+    st.markdown('<div class="section-heading">💬 Review Highlights</div>', unsafe_allow_html=True)
     col_p, col_n = st.columns(2)
     with col_p:
-        st.markdown(review_card(results["top_positive"], "positive"), unsafe_allow_html=True)
+        st.markdown(review_card_html(results.get("best_positive"), "positive"), unsafe_allow_html=True)
     with col_n:
-        st.markdown(review_card(results["top_negative"], "negative"), unsafe_allow_html=True)
+        st.markdown(review_card_html(results.get("best_negative"), "negative"), unsafe_allow_html=True)
 
-    # Watch link (blank for now)
-    st.markdown(f'<div class="watch-btn">📺 &nbsp;Watch {name} — link coming soon</div>', unsafe_allow_html=True)
+    # ── Row 6: Quick Stats ──
+    q1, q2, q3 = st.columns(3)
+    with q1:
+        st.markdown(stat_card("Avg Review Length", f"{results.get('avg_review_length', 0)} words", ""), unsafe_allow_html=True)
+    with q2:
+        st.markdown(stat_card("Community Votes", f"{results.get('community_votes', 0):,}", ""), unsafe_allow_html=True)
+    with q3:
+        st.markdown(stat_card("Helpfulness Ratio", f"{results.get('helpfulness_ratio', 0)}%", "green"), unsafe_allow_html=True)
+
+    # ── Row 7: Watch Link ──
+    st.markdown(f'<div class="watch-btn" style="margin-top: 1.5rem; text-align: center; padding: 1rem; background: var(--bg-card); border-radius: var(--radius); border: 1px solid var(--border-subtle); font-weight: 600; color: var(--text-primary); cursor: pointer;">📺 &nbsp;Watch {name} — link coming soon</div>', unsafe_allow_html=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -706,16 +892,91 @@ def main():
                 loser = res_b if winner is res_a else res_a
                 st.markdown(
                     f"""<div class="verdict-banner">
-                        <h3>🏆 {winner['movie_name']}</h3>
-                        <p>Scores higher at <b>{winner['avg_predicted_score']}/10</b> vs
-                        {loser['movie_name']} at <b>{loser['avg_predicted_score']}/10</b>.
-                        {winner['movie_name']} is {winner['sentiment_split']['Positive']}% positive
-                        while {loser['movie_name']} is {loser['sentiment_split']['Positive']}%.</p>
+                        <h3>🏆 {winner['movie_name']} wins the audience vote</h3>
+                        <div class="verdict-desc">
+                            Scores higher at <b>{winner['avg_predicted_score']}/10</b> vs
+                            {loser['movie_name']} at <b>{loser['avg_predicted_score']}/10</b>.<br>
+                            {winner['movie_name']} is {winner['sentiment_split']['Positive']}% positive
+                            while {loser['movie_name']} is {loser['sentiment_split']['Positive']}% positive.
+                        </div>
                     </div>""",
                     unsafe_allow_html=True,
                 )
 
                 st.divider()
+
+                # Comparison Table
+                st.markdown('<div class="section-heading">📊 Head-to-Head Comparison</div>', unsafe_allow_html=True)
+                
+                # Helper to format table cells and highlight winner
+                def cell(val_a, val_b, higher_is_better=True, suffix=""):
+                    cls_a = "winner" if (val_a > val_b and higher_is_better) or (val_a < val_b and not higher_is_better) else ""
+                    cls_b = "winner" if (val_b > val_a and higher_is_better) or (val_b < val_a and not higher_is_better) else ""
+                    # Handle equal
+                    if val_a == val_b:
+                        cls_a = cls_b = "winner"
+                    
+                    # Convert None to N/A for display, but logic above might fail on None. Handle safely:
+                    disp_a = f"{val_a}{suffix}" if val_a is not None else "N/A"
+                    disp_b = f"{val_b}{suffix}" if val_b is not None else "N/A"
+                    
+                    return f'<td class="{cls_a}">{disp_a}</td><td class="{cls_b}">{disp_b}</td>'
+
+                def safe_val(v): return v if v is not None else 0
+
+                html_table = f"""
+                <table class="cmp-table">
+                    <tr>
+                        <th>Metric</th>
+                        <th>{res_a['movie_name']}</th>
+                        <th>{res_b['movie_name']}</th>
+                    </tr>
+                    <tr>
+                        <td>AI Predicted Rating</td>
+                        {cell(res_a['avg_predicted_score'], res_b['avg_predicted_score'], suffix='/10')}
+                    </tr>
+                    <tr>
+                        <td>Avg User Rating</td>
+                        {cell(res_a.get('avg_user_rating'), res_b.get('avg_user_rating'), suffix='/10')}
+                    </tr>
+                    <tr>
+                        <td>Positive %</td>
+                        {cell(res_a['sentiment_split']['Positive'], res_b['sentiment_split']['Positive'], suffix='%')}
+                    </tr>
+                    <tr>
+                        <td>Mixed %</td>
+                        <td>{res_a['sentiment_split']['Mixed']}%</td>
+                        <td>{res_b['sentiment_split']['Mixed']}%</td>
+                    </tr>
+                    <tr>
+                        <td>Negative %</td>
+                        {cell(res_a['sentiment_split']['Negative'], res_b['sentiment_split']['Negative'], higher_is_better=False, suffix='%')}
+                    </tr>
+                    <tr>
+                        <td>Total Reviews</td>
+                        {cell(res_a['total_reviews'], res_b['total_reviews'])}
+                    </tr>
+                    <tr>
+                        <td>Avg Review Length</td>
+                        {cell(res_a.get('avg_review_length', 0), res_b.get('avg_review_length', 0), suffix=' words')}
+                    </tr>
+                    <tr>
+                        <td>Community Votes</td>
+                        {cell(res_a.get('community_votes', 0), res_b.get('community_votes', 0))}
+                    </tr>
+                    <tr>
+                        <td>Helpfulness Ratio</td>
+                        {cell(res_a.get('helpfulness_ratio', 0), res_b.get('helpfulness_ratio', 0), suffix='%')}
+                    </tr>
+                    <tr>
+                        <td>Spoiler %</td>
+                        {cell(res_a.get('spoiler_pct', 0), res_b.get('spoiler_pct', 0), higher_is_better=False, suffix='%')}
+                    </tr>
+                </table>
+                """
+                st.markdown(html_table, unsafe_allow_html=True)
+                st.divider()
+
                 r1, r2 = st.columns(2)
                 with r1:
                     render_report(res_a, key_suffix="_a")
