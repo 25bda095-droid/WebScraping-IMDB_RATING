@@ -1,52 +1,89 @@
-That's the overall shape of the app. Now let's break down each piece properly.
+# 🕸️ The Modern Web Scraping Guide: Inside CineScope
 
-## 1. Model I/O — the actual contract
+Welcome to the **Scraping Architecture Guide**. If you are looking at the CineScope source code and wondering how we manage to scrape hundreds of IMDb reviews in seconds without getting blocked or dealing with complex HTML parsing, this guide is for you.
 
-**Input to the model (per movie, batch-computed, not typed by a user):**
-- Raw `review_body` text (+ `review_title`)
-- Metadata: `franchise`, `format`, `spoiler`, `review_length`, `upvotes`/`downvotes`
+We are going to break down exactly how the scraper works, why we use the tools we do, and how you can apply these techniques to other modern React-based websites.
 
-**Output (per movie, stored, not recomputed live):**
-- `sentiment_split` — % positive / mixed / negative across all its reviews
-- `avg_predicted_score` — model's own numeric estimate, separate from the raw `user_rating` average
-- `rating_deviation` / `polarization_score` — how much reviewers disagree
-- `sentiment_trend_by_year` — array for a line chart
-- `top_positive_review` / `top_negative_review` — highest-upvoted real text on each side
-- `helpfulness_prediction` — used only if you build that secondary model
-- `mismatch_count` — reviews where sentiment ≠ rating (from the mismatch detector idea)
+---
 
-The user never sends text into the model live for the main flow — they just pick a movie, and you serve pre-computed JSON.
+## 1. The Problem with Traditional Scraping
+In the old days of the internet, you could simply use Python's `requests` and `BeautifulSoup` to download a website's HTML, find `<div class="review">`, and extract the text.
 
-## 2. Page-by-page breakdown
+**This no longer works on modern websites like IMDb.**
+Modern sites use frontend frameworks like React or Next.js (often called SPA — Single Page Applications). When you request the page, the server returns a nearly empty HTML shell and heavily obfuscated JavaScript. The actual data is dynamically loaded via APIs (like GraphQL) after the page loads in the user's browser. 
 
-**Landing page** — don't drop the user on an empty search bar. Show 3-4 curated rows: "Most positively reviewed," "Most polarizing," "Trending searches." Gives people something to click into immediately.
+If you try to use `BeautifulSoup`, you will only scrape empty `<div>` tags. 
 
-**Search bar** — fuzzy-match autocomplete against your ~1,100 movie list as they type. If nothing matches, show "not in our trained set — we'll fetch live reviews now" and trigger your scraper as a fallback (with a small loading state, since scraping takes a few seconds).
+---
 
-**Movie report page** (the core screen, shown in the diagram):
-- Header: poster, title, franchise/format badge, IMDb link
-- Sentiment donut + avg rating vs. franchise average
-- Rating/sentiment trend line by year
-- Two review cards: top upvoted positive, top upvoted negative
-- **Watch link button** — a "Watch now" button linking out. Since this is your own curated link, keep it simple: a per-movie or per-franchise URL you set yourself (or a JustWatch-style "where to watch" search link built from the movie title, which works for any movie without you manually mapping 1,100 links one by one)
+## 2. The Solution: Playwright + Data Hydration
+To scrape modern websites, we need a real browser that can execute JavaScript. That's why we use **[Playwright](https://playwright.dev/)**. Playwright boots up an invisible (headless) Chromium browser, navigates to IMDb, and waits for the JavaScript to execute and populate the page.
 
-**Compare page:**
-- Two movie search boxes side by side
-- Renders both report cards next to each other
-- Add one extra thing a single view can't show: a **head-to-head verdict line** — "Movie A is more positively reviewed (78% vs 61%) but Movie B is less polarizing" — this is the payoff of comparison mode, not just two cards stacked
+But we *still* don't parse the HTML directly. Instead, we use two advanced techniques: **State Hydration** and **GraphQL Interception**.
 
-**Optional "test your own review" page** — demoted to a small secondary feature, not the homepage, per what we discussed earlier.
+### Technique A: Intercepting `__NEXT_DATA__`
+When a Next.js website (like IMDb) loads, it embeds all the initial data needed for the page inside a hidden `<script>` tag with the ID `__NEXT_DATA__`. This is called "hydration data".
 
-## 3. Watch link — practical way to do it without manual work
+Instead of parsing HTML elements, we just grab this hidden JSON blob. It contains perfectly structured, clean data for the first batch of reviews!
 
-Rather than storing 1,100 individual links yourself, generate a dynamic search URL per movie, e.g. a JustWatch search link built from the movie title (`https://www.justwatch.com/us/search?q=<movie_name>`). One line of code, works for any movie including scraped ones outside your original 1,100, no manual link-curation needed. If you want it to feel more "curated," you can hardcode a handful of your own picks for the flagship movies you demo most, and fall back to the dynamic search link for everything else.
+**Here is the exact code from `app.py`:**
+```javascript
+// We execute this JavaScript INSIDE the headless browser:
+const el = document.querySelector("script#__NEXT_DATA__");
+const data = JSON.parse(el.textContent);
+const reviews = data?.props?.pageProps?.contentData?.data?.title?.reviews;
+```
+*Why do we do this inside `page.evaluate()`?* Because Python has strict memory limits for string transfers. By parsing the massive JSON string directly inside the browser's JavaScript engine, we avoid memory crashes and return only the clean, extracted review nodes back to Python.
 
-## 4. What makes this "usable by a normal user," concretely
+### Technique B: GraphQL Pagination
+Once we have the first batch of reviews from `__NEXT_DATA__`, we need to get the rest. When a user scrolls down on IMDb, the site doesn't load a new page. Instead, it fires a hidden API request to a **GraphQL** server to get more reviews.
 
-- Zero typing/pasting required for the core flow — search and click only
-- Fast — because everything for your 1,100 movies is pre-computed, not live-inferred
-- Graceful fallback for unknown movies (scrape once, cache forever) instead of failing
-- Comparison mode gives a reason to explore more than one movie per visit
-- Watch link closes the loop — the user came wanting to decide whether to watch something, and you end their journey with exactly that action
+We mimic this exact API call directly in our code:
 
-Want me to scaffold the actual Streamlit `app.py` with these pages (Home / Search / Report / Compare) and placeholder functions for the pre-computed lookup + scrape-fallback + watch-link generator, so you have working skeleton code to fill in with your real model?
+```python
+# From fetch_reviews_graphql_sync() in app.py
+gql_url = (
+    f"https://caching.graphql.imdb.com/?operationName=TitleReviewsRefine"
+    f"&variables={{'after': '{cursor}', 'const': '{title_id}'}}"
+    f"&extensions={{'persistedQuery': {{'sha256Hash': '{PERSISTED_HASH}'}}}}"
+)
+```
+By taking the `cursor` (the ID of the last review we scraped) and passing it to this endpoint, we trick IMDb into giving us the next 50 reviews in clean JSON format instantly. We run this in a fast loop until we hit our target.
+
+---
+
+## 3. Code Breakdown: The Lifecycle of a Scrape
+
+Here is exactly what happens when you type a movie ID into the CineScope UI:
+
+1. **Booting the Browser:** 
+   We launch Playwright using a context manager (`with sync_playwright()`). We pass a custom `user_agent` to make our bot look like a normal Google Chrome user on Linux.
+2. **Session Persistence (Cookies):**
+   If `imdb_session.json` exists, we load it. This file stores our cookies. It speeds up page loads because IMDb doesn't have to re-verify our session or show cookie consent banners.
+3. **Wait for Network Idle:**
+   We call `page.goto(url)` and explicitly tell Playwright to wait until the `__NEXT_DATA__` script is attached to the DOM.
+4. **Scrape & Aggregate:**
+   We execute our JSON extraction logic, convert the reviews into a flat list of dictionaries, and close the browser.
+5. **Pandas Conversion:**
+   The raw dictionaries are loaded into a `pandas.DataFrame`. Pandas allows us to effortlessly drop duplicates, fill missing values, calculate string lengths, and format the data before passing it to the ML model.
+
+---
+
+## 4. Why this approach is robust
+- **Speed:** We aren't scrolling and waiting for DOM updates. We query the GraphQL API directly for bulk data.
+- **Accuracy:** Scraping JSON guarantees that we don't accidentally miss a review because an HTML class name changed slightly (a common issue with BeautifulSoup).
+- **Stealth:** By using Playwright and saving cookies to `imdb_session.json`, we avoid triggering anti-bot mechanisms. 
+
+---
+
+## 📚 Summary of Required Libraries
+If you want to build a similar scraper for another site, this is the stack you need:
+
+| Library | Purpose in our Scraper |
+| :--- | :--- |
+| **`playwright`** | Boots the headless Chromium browser and executes JavaScript contexts. |
+| **`pandas`** | Organizes the scraped JSON into a fast, manipulatable table (DataFrame). |
+| **`json`** | Standard library used for encoding variables to send to GraphQL. |
+| **`urllib.parse`** | Standard library used to properly encode the URL strings for the API calls. |
+
+By combining Playwright's browser automation with direct API interception, you get the best of both worlds: the stealth of a real browser, and the blazing speed of an API integration!
