@@ -821,16 +821,18 @@ def analyze_movie(movie_id: str):
 def setup_deployment_environment():
     """Run once on startup to prepare Streamlit Cloud environment."""
     # 1. Write IMDb session secret to file if it exists
-    if "IMDB_SESSION" in st.secrets:
-        try:
+    try:
+        if "IMDB_SESSION" in st.secrets:
             with open(SESSION_FILE, "w", encoding="utf-8") as f:
                 f.write(st.secrets["IMDB_SESSION"])
-        except Exception:
-            pass
+    except Exception:
+        # st.secrets throws an error locally if secrets.toml doesn't exist at all
+        pass
 
     # 2. Ensure Playwright browsers are installed (for Streamlit Cloud)
-    os.system("playwright install chromium")
-    os.system("playwright install-deps chromium")
+    # We only install the binary. The system dependencies are handled by packages.txt.
+    if not os.path.exists(os.path.expanduser("~/.cache/ms-playwright")):
+        os.system("playwright install chromium")
 
 
 def main():

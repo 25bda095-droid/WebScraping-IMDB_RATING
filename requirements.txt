@@ -1,5 +1,6 @@
 streamlit
 pandas
 playwright
-torch==2.3.1
+torch
+torchvision
 transformers
